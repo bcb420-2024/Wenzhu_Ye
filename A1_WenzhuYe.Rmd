@@ -1,0 +1,515 @@
+---
+title: "BCB420 Assignment 1: Data Selection and Initial Processing"
+author: "Wenzhu Ye" 
+date: "`r Sys.Date()`"
+output:
+  html_document: 
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+# Introduction of the Dataset
+
+In this report, we are going to clean and normalize GEO data **GSE75168** for future analysis. The data target genetics and epigenetics change correlation with breast cancer sub-types, especially methlyation and acethylation of histone H3 lysine 4. Using a genome-wide ChIP-Seq approach, the data provide raw genomic count data of three human mammary cell lines: epithelial hyperplasia normal-basal sub-type (**MCF10A**), and two cancer sub-types: luminal(**MCF7**) and basal-like metastatic (**MDA-MB-231**) (*Messier et al. 2016*).
+
+# Step 1: Clean the data and map to HUGO symbols
+
+## Load in required package
+
+```{r, message = FALSE, warning=FALSE}
+# install and loading required packages
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+library(BiocManager)
+
+if (!requireNamespace("GEOquery", quietly = TRUE))
+  BiocManager::install("GEOquery")
+library(GEOquery)
+
+if (!requireNamespace("knitr", quietly = TRUE))
+  install.packages("knitr")
+library(knitr)
+
+if (!requireNamespace("kableExtra", quietly = TRUE))
+  install.packages("kableExtra")
+library(kableExtra)
+
+if (!requireNamespace("edgeR", quietly = TRUE))
+  BiocManager::install("edgeR")
+library(edgeR)
+
+if (!requireNamespace("tidyr", quietly = TRUE))
+  install.packages("tidyr")
+library(tidyr)
+
+if (!requireNamespace("biomaRt", quietly = TRUE))
+  BiocManager::install("biomaRt")
+library(biomaRt)
+
+```
+
+## Download the Data
+
+Download data using GEOquery package.
+
+```{r, message = FALSE, warning=FALSE}
+# download data only if the data is not already downloaded
+if (!'GSE75168' %in% list.files(path = ".")) {
+  # downloading data
+  raw_files <- getGEOSuppFiles('GSE75168')
+  
+  # get file path of the downloaded file
+  fpath <- rownames(raw_files)
+  print(fpath[1])
+  
+  # read in data
+  raw_data <- read.delim(fpath[1], header = TRUE, check.names = TRUE)
+} else {
+  # get file path, which is current diectory -> GSE75168 -> the only file in GSE75168
+  fpath <- paste(getwd(), '/', 'GSE75168', '/', list.files(path = "./GSE75168"), sep = "")
+  raw_data <- read.delim(fpath, header = TRUE, check.names = TRUE)
+}
+
+```
+
+A quick look over the data.
+
+```{r, message = FALSE, warning=FALSE}
+# only display the first 10 rows due to space limit
+kable(raw_data[1:10,], format = "html", caption = "<b>Table 1:</b> Overview of the raw sample data") %>% kable_styling(full_width = T, font_size = 12)
+```
+<br />
+Each row represent a difference gene, in which the gene’s Ensembl ID is the rowname, and each column repsence a different sample.
+
+## Access
+
+To look at the total coverage of the raw data:
+
+```{r, message = FALSE, warning=FALSE}
+dim(raw_data)
+```
+
+We can see that there are 20575 rows in total. Since each row represent a different gene, the inital coverage of the raw data is 20575 genes. Moreover, we have 10 columns, with one column containing gene Ensembl ID, we have 9 difference samples, which display below:
+
+```{r, message = FALSE, warning=FALSE}
+colnames(raw_data)
+```
+
+We can see that we have total of 9 samples, including 3 replicates of each cell line. As mentioned in the introduction, the control group is **MCF10A**, and two cancer sub-types are luminal, **MCF7**, and basal-like metastatic, **MDA-MB-231**.
+
+### Platform Description
+
+<!-- **Contact information about dataset:** -->
+<!-- ```{r, message = FALSE, warning=FALSE} -->
+<!-- # getting GEO SOFT format file -->
+<!-- gse <- getGEO("GSE75168", GSEMatrix = FALSE) -->
+<!-- kable(data.frame(head(Meta(gse))), format = "html") %>% kable_styling(full_width = F) -->
+<!-- ``` -->
+<!-- <br /> -->
+```{r, message = FALSE, warning=FALSE}
+# getting platform information
+gse <- getGEO("GSE75168", GSEMatrix = FALSE) 
+gpl_info <- Meta(getGEO(names(GPLList(gse))[1]))
+
+# create vector of wanted information's name
+Category <- c("Platform title", "Submission data", "Last update data", "Organims", "Number of GEO datasets that use this techology", "Number of GEO samples that use this technology")
+# retrieve information
+Infomation <- c(gpl_info$title, gpl_info$submission_date, gpl_info$last_update_date, gpl_info$organism, length(gpl_info$series_id), length(gpl_info$sample_id))
+kable(data.frame(Category, Infomation), format = "html", caption = "<b>Table 2:</b> Data background and platform description") %>% kable_styling(full_width = F)
+```
+## Clean
+### Gene with NA value
+We need to handle any gene that have missing value. First, we will check if there are any gene with NA value.
+```{r, message = FALSE, warning=FALSE}
+# check if data contains NA
+any(is.na(raw_data))
+```
+Since there are no gene with missing value, we will not worry about this case.
+
+### Remove Outliers - Remove gene with Low Count
+We need to remove gene without at least 1 read per million in n of samples. Since we have 3 replicates for each different cell line, thus, we need to filter out genes that don’t have 3 read per million in each cell line.
+```{r, message = FALSE, warning=FALSE}
+# convert count to count per miliion
+cpms <- cpm(raw_data[, 2:10])
+rownames(cpms) <- raw_data[, 1]
+
+# only keep rows with at least 3 read per million
+keep <- rowSums(cpms > 1) >= 3
+raw_data_hig <- raw_data[keep, ]
+rownames(raw_data_hig) <- raw_data_hig[, 1]
+```
+
+Number of genes we filtered out:
+
+```{r, message = FALSE, warning=FALSE}
+nrow(raw_data) - nrow(raw_data_hig)
+```
+
+
+### Duplicate Gene
+
+```{r, message = FALSE, warning=FALSE}
+# sort by number of times each Ensembl ID appears in the data
+summarized_gene_counts <- sort(table(raw_data_hig$Ensembl_ID), decreasing = TRUE)
+
+# print out number of duplicate gene
+length(summarized_gene_counts[which(summarized_gene_counts > 1)])
+```
+<br/>
+Since the print out value is 0, there are no duplicate genes in our data.
+
+### Define Sample Groups
+
+We than create a data frame containing the group information, which stored the information of each sample’s cell line and replicate.
+```{r, message = FALSE, warning=FALSE}
+# split the sample name into cell line and replicate
+sample_group <- data.frame(lapply(colnames(raw_data)[2:10], 
+                                  FUN=function(x){unlist(strsplit(x, split = "\\_"))}))
+colnames(sample_group) <- colnames(raw_data)[2:10]
+rownames(sample_group) <- c("cell_line", "replicate")
+
+# transform into dataframe
+sample_group <- data.frame(t(sample_group))
+kable(sample_group, format = "html", caption = "<b>Table 3:</b> Data cell line and replicate information") %>% kable_styling(full_width = F)
+```
+
+## Map
+By the data displayed above, we see that our data only have Ensembl ID. We need to convert ensemble id to HUGO gene symbol. First, we need to get a conversion table of Ensembl ID map to corresponding gene symbol.
+```{r, message = FALSE, warning=FALSE}
+# select Mart and Dataset
+ensembl <- useMart("ENSEMBL_MART_ENSEMBL")
+ensembl <- useDataset("hsapiens_gene_ensembl", mart = ensembl)
+
+# use desired data to convert ensemble id to HUGO gene symbol
+id_conversion <- getBM(attributes = c("ensembl_gene_id_version","hgnc_symbol"),
+                         filters = c("ensembl_gene_id_version"),
+                         values = raw_data_hig$Ensembl_ID,
+                         mart = ensembl)
+kable(id_conversion[1:10, ], format = "html", caption = "<b>Table 4:</b> Ensembl gene ID with version number map to HGNC gene symbol") %>% kable_styling(full_width = F)
+```
+<br/>
+However, consider the number of map we get:
+
+```{r, message = FALSE, warning=FALSE}
+nrow(id_conversion)
+```
+We only get about 10% match. In order to resolve this issue, since the Ensembl ID of our data include the version number, we will drop the version and map with only the Ensembl ID.
+
+Another important factor we need to consider is that due to the time of submission data date and the context of the paper, we will not using the latest Ensembl-HUGO conversion version, instead, we will use the Ensembl 77(published on 2014 Oct), which is the version the data used.
+
+With the consideration of the above two factors, we will remap our data.
+
+```{r, message = FALSE, warning=FALSE}
+# select Mart and Dataset with wanted version
+ensembl <- useMart("ENSEMBL_MART_ENSEMBL", host="https://oct2014.archive.ensembl.org")
+ensembl <- useDataset("hsapiens_gene_ensembl", mart = ensembl)
+
+# split current Ensembl ID with version into two columns: Ensembl ID and version number
+raw_data_hig <- raw_data_hig %>% tidyr::separate(Ensembl_ID, c("id", "version"), "\\.")
+
+# use desired data to convert ensemble id to HUGO gene symbol
+id_conversion <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"),
+                         filters = c("ensembl_gene_id"),
+                         values = raw_data_hig$id,
+                         mart = ensembl)
+kable(id_conversion[1:10, ], format = "html", caption = "<b>Table 5:</b> Ensembl gene ID map to HGNC gene symbol using Ensembl 77") %>% kable_styling(full_width = F)
+```
+<br/>
+To check again the number of match we got:
+```{r, message = FALSE, warning=FALSE}
+nrow(id_conversion)
+```
+Which is a much better match result(~99%).
+
+Since we omit the version number, we need to check our conversion table to prevent the issue of one Ensembl ID map to more than one gene symbol.
+
+```{r, message = FALSE, warning=FALSE}
+# sort by number of times each Ensembl ID appears in the data
+n_occur <- data.frame(table(id_conversion$ensembl_gene_id))
+
+# filter out only genes appears more than once in the data
+kable(n_occur[n_occur$Freq > 1, ], format = "html", caption = "<b>Table 6:</b> Ensembl gene ID map to more than one HGNC gene symbol") %>% kable_styling(full_width = F)
+```
+
+<br/>
+There is one Ensembl id that map to 2 different gene symbol: **ENSG00000279010**.
+
+```{r, message = FALSE, warning=FALSE}
+kable(id_conversion %>% dplyr::filter(ensembl_gene_id == 'ENSG00000279010'), 
+      format = "html", caption = "<b>Table 7:</b> Ensembl gene ID map to more than one HGNC gene symbol with gene symbol detail") %>% kable_styling(full_width = F)
+```
+
+<br/>
+With the consideration of its version number:
+
+```{r, message = FALSE, warning=FALSE}
+kable((raw_data_hig %>% dplyr::filter(id == 'ENSG00000279010'))[, 1:6], 
+      format = "html", caption = "<b>Table 8:</b> Ensembl gene ID map to more than one HGNC gene symbol with version number") %>% kable_styling(full_width = F)
+```
+
+<br/>
+We find the the proper Ensembl ID with version number is **ENSG00000279010.1**. After searching online, we will keep the row with gene symbol **MIR4534**.
+
+```{r, message = FALSE, warning=FALSE}
+# remove the row with gene symbol MIR6820
+id_conversion <- subset(id_conversion, !(id_conversion$ensembl_gene_id == "ENSG00000279010" 
+                                 & id_conversion$hgnc_symbol == "MIR6820"))
+```
+
+With no duplicate Ensembl ID, we will merge the conversion table and our cleaned raw data.
+
+```{r, message = FALSE, warning=FALSE}
+# merge raw data with mapping conversion using Ensembl ID
+raw_data_hig_annot <- merge(id_conversion, raw_data_hig, by.x = 1, by.y = 1, all.y = TRUE)
+```
+
+Now we need to check the number of gene we were not able to match.
+
+```{r, message = FALSE, warning=FALSE}
+# total number of gene minus number of mapped genes
+nrow(raw_data_hig) - length(which(raw_data_hig$id %in% id_conversion$ensembl_gene_id))
+```
+
+There are 3 genes we were not able to match, we will print them out in table to investigate why.
+
+```{r, message = FALSE, warning=FALSE}
+# filter out rows that don't have HUGO symbol
+ensembl_id_missing_gene <- raw_data_hig_annot$ensembl_gene_id[which(is.na(raw_data_hig_annot$hgnc_symbol))]
+kable(raw_data_hig_annot[is.na(raw_data_hig_annot$hgnc_symbol), ][, 1:6], 
+      format = "html", caption = "<b>Table 9:</b> Ensembl gene ID does not map to any HGNC gene symbol") %>% kable_styling(full_width = F)
+```
+<br/>
+We will not filter those rows our right now since for our research purpose of differential expression, those rows might contribute to potential significant result. Also, those rows each represent unique element and there is no need to worried them right now. Notice that the alignment not unique row could explain why we did not find any replicate gene before.
+
+Overview of the final mapped data
+```{r, message = FALSE, warning=FALSE}
+# filter out rows that don't have HUGO symbol
+kable(raw_data_hig_annot[1:10, 1:6], 
+      format = "html", caption = "<b>Table 10:</b> Data with HGNC gene symol") %>% kable_styling(full_width = F)
+```
+
+# Step 2: Apply Normalization
+
+## Normalization Process
+In our data, the deregulated genes and the non-deregulated genes does not have similar behaviors, but the total expression are the same. Also, according to the paper, the experimental design and condition are similar and the cell amount is the same for each sample. Thus, with the above assumptions, we will use the normalize method total count normalization (*Evans et al. 2017*).
+```{r, message = FALSE, warning=FALSE}
+# convert data into DGEList object
+filtered_data_matrix <- as.matrix(raw_data_hig_annot[, 4:12])
+rownames(filtered_data_matrix) <- raw_data_hig_annot$hgnc_symbol
+d <- DGEList(counts=filtered_data_matrix, group = sample_group$cell_line)
+
+# normalize by count per million
+nf <- calcNormFactors(d)
+normalzied_data_annon <- cpm(nf)
+```
+
+## Pre-normalization and Post-normalization Data Distribution
+
+After our data is normalized, we will compare the pre-normalization and post-normalization data distribution to examine the quality change of the normalized data.
+
+
+### Boxplot
+
+```{r, message = FALSE, warning=FALSE, fig.show="hold", out.width="50%", fig.cap="\\label{fig:figs}<b>Figure 1</b> Boxplot with (1) Pre-normalization data (2) Post-normalization data"}
+# draw pre-normalized boxplot
+bplot_raw <- log2(cpm(raw_data_hig_annot[,4:12]))
+boxplot(bplot_raw, xlab = "Samples", ylab = "log2 Counts per Million",
+        las = 2, cex = 0.5, cex.lab = 0.5,
+        cex.axis = 0.5, main = "Pre-normalization box plot")
+mtext("(1)", line=3)
+# draw the median on box plot
+abline(h = median(apply(bplot_raw, 2, median)),
+       col = "red", lwd = 2, lty = "dashed")
+
+# draw post-normalized boxplot
+bplot_norm <- log2(normalzied_data_annon)
+boxplot(bplot_norm, xlab = "Samples", ylab = "log2 Counts per Million",
+        las = 2, cex = 0.5, cex.lab = 0.5,
+        cex.axis = 0.5, main = "Post-normalization box plot")
+mtext("(2)", line=3)
+# draw the median on each box plot
+abline(h = median(apply(bplot_norm, 2, median)),
+       col = "red", lwd = 2, lty = "dashed")
+```
+
+
+### Density Plot
+
+```{r, message = FALSE, warning=FALSE, fig.show="hold", out.width="50%", fig.cap="\\label{fig:figs}<b>Figure 2</b> Density plot with (1) Pre-normalization data, (2) Post-normalization data"}
+# pre-normalization plot
+counts_density_raw <- apply(log2(cpm(raw_data_hig_annot[, 4:12])), 2, density)
+# calculate the limits across all the samples
+xlim <- 0
+ylim <- 0
+for (i in 1:length(counts_density_raw)) {
+  xlim <- range(c(xlim, counts_density_raw[[i]]$x))
+  ylim <- range(c(ylim, counts_density_raw[[i]]$y))
+}
+cols <- rainbow(length(counts_density_raw))
+ltys <- rep(1, length(counts_density_raw))
+# plot the first density plot to initialize the plot
+plot(counts_density_raw[[1]], xlim = xlim, ylim = ylim, type = "n",
+     ylab = "Smoothing density of log2-CPM",
+     main = "Pre-normalization denstiy plot", cex.lab = 0.85)
+mtext("(1)", line=3)
+# plot each line
+for (i in 1:length(counts_density_raw)) {
+  lines(counts_density_raw[[i]], col = cols[i], lty = ltys[i])
+}
+# create legend
+legend("topright", colnames(bplot_raw),
+       col = cols, lty = ltys, cex = 0.75,
+       border = "blue",  text.col = "green4",
+       merge = TRUE, bg = "gray90")
+
+# post-normalization plot
+counts_density_norm <- apply(log2(normalzied_data_annon), 2, density)
+# calculate the limits across all the samples
+xlim <- 0
+ylim <- 0
+for (i in 1:length(counts_density_norm)) {
+  xlim <- range(c(xlim, counts_density_norm[[i]]$x))
+  ylim <- range(c(ylim, counts_density_norm[[i]]$y))
+}
+cols <- rainbow(length(counts_density_norm))
+ltys <- rep(1, length(counts_density_norm))
+# plot the first density plot to initialize the plot
+plot(counts_density_norm[[1]], xlim = xlim, ylim = ylim, type = "n",
+     ylab = "Smoothing density of log2-CPM",
+     main = "Post-normalization denstiy plot", cex.lab = 0.85)
+mtext("(2)", line=3)
+# plot each line
+for (i in 1:length(counts_density_norm)) {
+  lines(counts_density_norm[[i]], col = cols[i], lty = ltys[i])
+}
+# create legend
+legend("topright", colnames(bplot_norm),
+       col = cols, lty = ltys, cex = 0.75,
+       border ="blue",  text.col = "green4",
+       merge = TRUE, bg = "gray90")
+```
+
+By comparing the pre-normalization and post-normalization data distribution, we can obersve that there are less variance within data. From the box plot, the post-normalization median for each sample are more close to the total median line and the data is less dispersed compare to the pre-normalization. Similar trend is also observed from the density plot.
+
+## Post Normalization MDS Plot
+
+We will also use Multidimensional scaling (MDS) plot to compare between single samples, and to investigate the distance between samples. Ideally, samples with similaire expression will cluster together.
+
+```{r, message = FALSE, warning=FALSE, fig.cap="\\label{fig:figs}<b>Figure 3</b> MDS plot"}
+plotMDS(nf, labels = rownames(sample_group), 
+        col = c("darkgreen", "blue")[factor(sample_group$cell_line)], 
+        main = "MDS Plot")
+```
+
+From this plot, the blue cluster is the luminal cell line, the black cluster is the basal-like metastatic, and the green cluster is the normal-like subtype. We can see that our data is strong that our data cluster together, which indicates there is little variation between replicates when grouping by cell lines.
+
+
+## Dispersion
+
+```{r, message = FALSE, warning=FALSE, fig.show="hold", out.width="50%", fig.cap="\\label{fig:figs}<b>Figure 4</b> Disperion of the data with (1) Biological coefficient of variation(BCV) Plot (2) displaying Mean-Variance plot"}
+# setup plot assumptions
+model_design <- model.matrix(~sample_group$replicate + sample_group$cell_line + 0)
+nf_d <- estimateDisp(nf, model_design)
+
+# plot BCV plot to investigate dispersion
+plotBCV(nf_d,col.tagwise = "black",col.common = "red",main = "BCV Plot")
+mtext("(1)", line=3)
+
+# plot Mean-Variance plot to investigate relationship between mean and variance 
+# of expression data
+plotMeanVar(nf_d, show.raw.vars = TRUE, show.tagwise.vars=TRUE,
+            show.ave.raw.vars = TRUE,
+            NBline = TRUE,
+            show.binned.common.disp.vars = TRUE, main = "Mean Variance")
+mtext("(2)", line=3)
+```
+
+Biological coefficient of variation(BCV) Plots can be used to to look at dispersion. Each of the dots in the given BCV plot is the BCV for a gene from our data set. Since the common dispersion is between 0.2 - 0.4, our data is considered reasonable and could detect more deregulated genes (*Gu 2015*). The Mean-Variance plot also shows a promising correlation between mean and variance of the sample data. The factors dispalyed by the two plot indicate that out data has been normalized to the point where it is suitable for further analysis.
+
+
+
+# Final Data
+
+Here display our final data cleaned and normalized. The row name is HUGO gene symbol, and each row represent a different gene. The column name is the sample name, and each column represent a different sample’s normalized count per million expression data.
+
+```{r, message = FALSE, warning=FALSE}
+kable(normalzied_data_annon[10:20, ], format = "html", caption = "<b>Table 11:</b> Cleaned and normalized data") %>% 
+  kable_styling(full_width = F, font_size = 12)
+```
+
+<br />
+**Final coverage:**
+```{r, message = FALSE, warning=FALSE}
+nrow(normalzied_data_annon)
+```
+
+# Interpretation Questions
+
+**Why is the dataset of interest to you?**
+
+Breast cancer is one of the most common type of the cancer, thus, investigate the potential genetic factors invovled in breast cancer’s mechanism becomes crucial. Moreover, previous studies also indicate that methlyation and acethylation of histone H3 lysine 4 is a well-established marker of active or poised transcription (Kimura 2013). With this information, I think it would be intersting to look at how the modification of histone H3 lysine 4 would affect gene expression of the two breast cancer subtypes luminal and basal-like metastatic compare to normal breast cancer cell line.
+
+**What are the control and test conditions of the dataset?**
+
+The control of the dataset is the cell line is normal-like subtype (MCF10A), and two test conditions are luminal(MCF7) and basal-like metastatic (MDA-MB-231).
+
+**How many samples in each of the conditions of your dataset?**
+
+There are 9 samples in total, and 3 samples for each condition.
+
+**Were there expression values that were not unique for specific genes? How did you handle these?**
+
+There were no expression value that were not unique for specific genes.
+
+**Were there expression values that could not be mapped to current HUGO symbols?**
+
+There are 3 observations that could not mapped to current HUGO symbols, which is mention above. The 3 observations are alignment not unique, no feathers, and ambiguous, which will not affect our result and we will not filtered out in current phases.
+
+**Were there any outliers in your dataset? How were they handled in the originating paper? How many outliers were removed?**
+
+There were outliers in my dataset. There are total of 6297 genes removed due to their low count number that they don’t have 3 read per million in each cell line. No other outliers were removed. In the orginal paper, the paper did not discuss about outliers.
+
+**How did you handle replicates?**
+
+There are 3 biological replicate per each of the 3 cell lines like mentioned above. When we normalize our data, we group the data by cell line, and perform normalization across replicates for each cell line. Also, genes don’t have 3 read per million in each cell line (because we have 3 replicates) were removed.
+
+**What is the final coverage of your dataset?**
+
+The final coverage is 14278 genes, which is about 69% of the initial raw data.
+
+# Reference
+Messier TL, Gordon JAR, Boyd JR, Tye CE, Browne G, Stein JL, Lian JB, Stein GS. 2016. Histone H3 lysine 4 acetylation and methylation dynamics define breast cancer subtypes. Oncotarget. 7(5):5094–5109. doi:https://doi.org/10.18632/oncotarget.6922.
+
+Evans C, Hardin J, Stoebel DM. 2017. Selecting between-sample RNA-Seq normalization methods from the perspective of their assumptions. Briefings in Bioinformatics. 19(5):776–792. doi:https://doi.org/10.1093/bib/bbx008.
+
+Some key factors for number of significant DE genes. 2015 Nov 2. CVR Bioinformatics. https://bioinformatics.cvr.ac.uk/some-key-factors-for-number-of-significant-de-genes/.
+
+Kimura H. Histone modifications for human epigenome analysis. J Hum Genet. 2013; 58:439-445.
+
+Ruth Isserlin, Course Lectures (2024)
+
+Morgan M, Ramos M (2023). _BiocManager: Access the Bioconductor Project Package
+  Repository_. R package version 1.30.22,
+  <https://CRAN.R-project.org/package=BiocManager>.
+
+Davis, S. and Meltzer, P. S. GEOquery: a bridge between the Gene Expression Omnibus
+  (GEO) and BioConductor. Bioinformatics, 2007, 14, 1846-1847
+  
+Xie Y (2023). _knitr: A General-Purpose Package for Dynamic Report Generation in R_. R
+  package version 1.45, <https://yihui.org/knitr/>.
+
+Zhu H (2021). _kableExtra: Construct Complex Table with 'kable' and Pipe Syntax_. R
+  package version 1.3.4, https://github.com/haozhu233/kableExtra,
+  <http://haozhu233.github.io/kableExtra/>.
+
+Robinson MD, McCarthy DJ and Smyth GK (2010). edgeR: a Bioconductor package for
+  differential expression analysis of digital gene expression data. Bioinformatics 26,
+  139-140
+
+Wickham H, Vaughan D, Girlich M (2023). _tidyr: Tidy Messy Data_. R package version
+  1.3.0, <https://CRAN.R-project.org/package=tidyr>.
+
+BioMart and Bioconductor: a powerful link between biological databases and microarray
+  data analysis. Steffen Durinck, Yves Moreau, Arek Kasprzyk, Sean Davis, Bart De Moor,
+  Alvis Brazma and Wolfgang Huber, Bioinformatics 21, 3439-3440 (2005).
